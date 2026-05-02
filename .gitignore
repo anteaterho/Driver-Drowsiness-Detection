@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+
+.claude/
+
+.DS_Store
+Thumbs.db
+
+face_landmarker.task
