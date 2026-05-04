@@ -20,6 +20,14 @@ EAR_THRESHOLD = 0.22
 # 눈 감김이 이 프레임 수 이상 이어지면 졸음으로 판정한다.
 CONSEC_FRAMES = 20
 
+# 고개 자세(좌우 회전·숙임) UI 슬라이더 기본값 — 환경에 맞게 앱에서 조정
+HEAD_YAW_THRESHOLD_DEFAULT = 0.35
+HEAD_PITCH_THRESHOLD_DEFAULT = 0.38
+
+# MediaPipe 얼굴 랜드마크: 코 끝, 턱(아래쪽) — 고개 각도 근사에 사용
+NOSE_TIP_IDX = 1
+CHIN_IDX = 152
+
 
 def _ensure_model() -> None:
     # 모델 파일이 없으면 처음 한 번만 자동 다운로드한다.
@@ -52,6 +60,38 @@ def _get_pts(landmarks, indices: list, w: int, h: int) -> list:
     return [(int(landmarks[i].x * w), int(landmarks[i].y * h)) for i in indices]
 
 
+def _mean_norm_xy(landmarks, indices: list) -> tuple[float, float]:
+    """랜드마크 인덱스들의 정규화 좌표(0~1) 평균."""
+    xs = [float(landmarks[i].x) for i in indices]
+    ys = [float(landmarks[i].y) for i in indices]
+    return float(np.mean(xs)), float(np.mean(ys))
+
+
+def _head_pose_metrics(landmarks) -> tuple[float, float]:
+    """
+    정규화 좌표 기준 근사 지표.
+    - yaw: 코가 양눈 중점에서 벗어난 정도 / 눈 간 거리 (좌우 돌림이 클수록 커짐)
+    - pitch: (코_y - 눈중_y) / (턱_y - 눈중_y) — 고개를 숙이면 보통 값이 커짐
+    """
+    lx, ly = _mean_norm_xy(landmarks, LEFT_EYE)
+    rx, ry = _mean_norm_xy(landmarks, RIGHT_EYE)
+    nx = float(landmarks[NOSE_TIP_IDX].x)
+    ny = float(landmarks[NOSE_TIP_IDX].y)
+    cy = float(landmarks[CHIN_IDX].y)
+
+    eye_mx = (lx + rx) * 0.5
+    eye_my = (ly + ry) * 0.5
+    ipd = float(np.hypot(rx - lx, ry - ly)) + 1e-6
+    yaw_m = abs(nx - eye_mx) / ipd
+
+    denom = (cy - eye_my) + 1e-6
+    if denom <= 1e-5:
+        pitch_m = 0.0
+    else:
+        pitch_m = (ny - eye_my) / denom
+    return yaw_m, pitch_m
+
+
 class DrowsinessDetector:
     def __init__(self):
         # 얼굴 랜드마크 모델 준비
@@ -66,7 +106,15 @@ class DrowsinessDetector:
         )
         self._detector = mp_vision.FaceLandmarker.create_from_options(options)
 
-    def detect(self, rgb_frame: np.ndarray, counter: int, ear_threshold: float = EAR_THRESHOLD) -> dict:
+    def detect(
+        self,
+        rgb_frame: np.ndarray,
+        counter: int,
+        ear_threshold: float = EAR_THRESHOLD,
+        head_pose_enabled: bool = False,
+        head_yaw_threshold: float = HEAD_YAW_THRESHOLD_DEFAULT,
+        head_pitch_threshold: float = HEAD_PITCH_THRESHOLD_DEFAULT,
+    ) -> dict:
         # 입력 프레임 크기 확인
         h, w = rgb_frame.shape[:2]
         # numpy 이미지를 MediaPipe 형식으로 변환
@@ -82,6 +130,12 @@ class DrowsinessDetector:
                 "l_pts": None,
                 "counter": 0,
                 "drowsy": False,
+                "head_pose_enabled": head_pose_enabled,
+                "head_yaw_metric": None,
+                "head_pitch_metric": None,
+                "head_yaw_threshold": head_yaw_threshold,
+                "head_pitch_threshold": head_pitch_threshold,
+                "head_pose_alert": False,
             }
 
         # 첫 번째 얼굴의 랜드마크 사용
@@ -99,6 +153,11 @@ class DrowsinessDetector:
         else:
             counter = 0
 
+        head_yaw_m, head_pitch_m = _head_pose_metrics(lm)
+        head_pose_alert = False
+        if head_pose_enabled:
+            head_pose_alert = (head_yaw_m > head_yaw_threshold) or (head_pitch_m > head_pitch_threshold)
+
         # 이후 app.py에서 그리기/문구 표시할 수 있도록 정보 패키징
         return {
             "face_found": True,
@@ -108,4 +167,10 @@ class DrowsinessDetector:
             "counter": counter,
             "threshold": ear_threshold,
             "drowsy": counter >= CONSEC_FRAMES,
+            "head_pose_enabled": head_pose_enabled,
+            "head_yaw_metric": head_yaw_m,
+            "head_pitch_metric": head_pitch_m,
+            "head_yaw_threshold": head_yaw_threshold,
+            "head_pitch_threshold": head_pitch_threshold,
+            "head_pose_alert": head_pose_alert,
         }

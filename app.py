@@ -1,10 +1,86 @@
 import threading  # 웹캠 캡처를 백그라운드 스레드에서 돌리기 위해 사용
+import time  # 아두이노 Uno USB 연결 직후 리셋 대기용
 
 import cv2  # 웹캠 영상 읽기, 색상 변환, 화면에 선/글자 그리기
 import gradio as gr  # 웹에서 실행되는 간단한 UI(버튼, 이미지 출력) 구성
 import numpy as np  # 점 좌표를 배열로 바꿔 눈 윤곽선 그릴 때 사용
 
-from detector import DrowsinessDetector, CONSEC_FRAMES, EAR_THRESHOLD  # 감지 로직 클래스와 기준값들
+from detector import (
+    CONSEC_FRAMES,
+    DrowsinessDetector,
+    EAR_THRESHOLD,
+    HEAD_PITCH_THRESHOLD_DEFAULT,
+    HEAD_YAW_THRESHOLD_DEFAULT,
+)  # 감지 로직 클래스와 기준값들
+
+try:
+    import serial  # 아두이노 COM 포트로 LED 제어 신호 전송
+except ImportError:
+    serial = None  # type: ignore
+
+# 아두이노 시리얼 포트 (Windows: COM9). `arduino_led.ino`는 '1'=LED ON, '0'=LED OFF
+ARDUINO_PORT = "COM9"
+ARDUINO_BAUD = 9600
+
+
+class _ArduinoLedSync:
+    """졸음 상태가 바뀔 때만 시리얼로 1/0 전송(버퍼 과다 방지)."""
+
+    def __init__(self, port: str, baud: int) -> None:
+        self._port = port
+        self._baud = baud
+        self._ser = None
+        self._last_sent: bool | None = None
+        self._reset_wait_done = False
+
+    def sync(self, drowsy: bool) -> None:
+        if drowsy == self._last_sent:
+            return
+        self._last_sent = drowsy
+        payload = b"1\n" if drowsy else b"0\n"
+        self._write(payload)
+
+    def _write(self, data: bytes) -> None:
+        if serial is None:
+            return
+        try:
+            if self._ser is None or not self._ser.is_open:
+                self._ser = serial.Serial(self._port, self._baud, timeout=0.2)
+                if not self._reset_wait_done:
+                    time.sleep(1.8)
+                    self._reset_wait_done = True
+            self._ser.write(data)
+            self._ser.flush()
+        except OSError as e:
+            print(f"[Arduino] 포트 오류 ({self._port}): {e}")
+            self._close_port_only()
+        except Exception as e:
+            print(f"[Arduino] 전송 실패: {e}")
+            self._close_port_only()
+
+    def _close_port_only(self) -> None:
+        if self._ser is not None:
+            try:
+                if self._ser.is_open:
+                    self._ser.close()
+            except OSError:
+                pass
+        self._ser = None
+
+    def shutdown(self) -> None:
+        if serial is None:
+            return
+        try:
+            if self._ser is not None and self._ser.is_open:
+                self._ser.write(b"0\n")
+                self._ser.flush()
+        except OSError:
+            pass
+        self._close_port_only()
+        self._last_sent = None
+
+
+_arduino_led = _ArduinoLedSync(ARDUINO_PORT, ARDUINO_BAUD)
 
 # 졸음 감지기 객체를 한 번 만들어서 계속 재사용
 detector = DrowsinessDetector()
@@ -14,12 +90,16 @@ _GREEN  = (0,   255, 0)
 _ORANGE = (255, 165, 0)
 _RED    = (255,   0, 0)
 _YELLOW = (255, 255, 0)
+_CYAN   = (0, 255, 255)
 
 # 백그라운드 캡처 스레드와 공유하는 상태값들
 _lock    = threading.Lock()
 _running = False
 _counter = 0
 _ear_threshold = float(EAR_THRESHOLD)
+_head_pose_enabled = False
+_head_yaw_thr = float(HEAD_YAW_THRESHOLD_DEFAULT)
+_head_pitch_thr = float(HEAD_PITCH_THRESHOLD_DEFAULT)
 _latest_frame:  np.ndarray | None = None
 _latest_status: str = "웹캠을 시작해주세요"
 
@@ -46,6 +126,12 @@ def _render(rgb: np.ndarray, info: dict) -> tuple[np.ndarray, str]:
     ear     = info["avg_ear"]
     threshold = info.get("threshold", EAR_THRESHOLD)
     counter = info["counter"]
+    head_en = bool(info.get("head_pose_enabled", False))
+    head_alert = bool(info.get("head_pose_alert", False))
+    yaw_thr = float(info.get("head_yaw_threshold", HEAD_YAW_THRESHOLD_DEFAULT))
+    pitch_thr = float(info.get("head_pitch_threshold", HEAD_PITCH_THRESHOLD_DEFAULT))
+    yaw_m = info.get("head_yaw_metric")
+    pitch_m = info.get("head_pitch_metric")
 
     # 졸음이 확정되면 빨간 오버레이 + 큰 경고 문구를 띄운다.
     if info["drowsy"]:
@@ -56,10 +142,19 @@ def _render(rgb: np.ndarray, info: dict) -> tuple[np.ndarray, str]:
         cv2.putText(out, "! DROWSY !", (w // 2 - 120, h // 2),
                     cv2.FONT_HERSHEY_DUPLEX, 1.6, _RED, 3)
         status = f"🚨 졸음 감지!  EAR: {ear:.3f} (기준: {threshold:.3f})"
+        if head_en and head_alert and yaw_m is not None and pitch_m is not None:
+            status += f" | 고개경고 Y:{yaw_m:.2f} P:{pitch_m:.2f}"
     # 아직 졸음 확정은 아니지만, 눈을 감은 프레임이 누적되는 중
     elif counter > 0:
         eye_color = _ORANGE
         status = f"😴 눈 감음 감지 중 ({counter}/{CONSEC_FRAMES})  EAR: {ear:.3f} (기준: {threshold:.3f})"
+    # 고개 숙임·좌우 회전이 임계값을 넘은 경우
+    elif head_en and head_alert and yaw_m is not None and pitch_m is not None:
+        eye_color = _CYAN
+        status = (
+            f"↔️ 고개 자세 경고  yaw {yaw_m:.2f} > {yaw_thr:.2f} "
+            f"또는 pitch {pitch_m:.2f} > {pitch_thr:.2f}  |  EAR: {ear:.3f}"
+        )
     # 정상 상태
     else:
         eye_color = _GREEN
@@ -74,6 +169,16 @@ def _render(rgb: np.ndarray, info: dict) -> tuple[np.ndarray, str]:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, _YELLOW, 2)
     cv2.putText(out, f"Count: {counter}/{CONSEC_FRAMES}", (10, 90),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, _YELLOW, 2)
+
+    if head_en and yaw_m is not None and pitch_m is not None:
+        cv2.putText(
+            out,
+            f"HEAD yaw {yaw_m:.2f}/{yaw_thr:.2f}  pitch {pitch_m:.2f}/{pitch_thr:.2f}",
+            (10, h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            _CYAN if head_alert else _YELLOW,
+            2,
+        )
 
     return out, status
 
@@ -92,29 +197,48 @@ def _capture_loop() -> None:
         _running = False
         return
 
-    # _running이 True인 동안 계속 프레임 처리
-    while _running:
-        ret, bgr = cap.read()
-        if not ret:
-            continue
+    try:
+        # _running이 True인 동안 계속 프레임 처리
+        while _running:
+            ret, bgr = cap.read()
+            if not ret:
+                continue
 
-        # OpenCV 기본 BGR -> RGB 변환 (Gradio/MediaPipe와 맞추기)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # 수평 반전(거울 모드) — 사용자가 보는 방향과 동일하게 보이도록
+            bgr = cv2.flip(bgr, 1)
+            # OpenCV 기본 BGR -> RGB 변환 (Gradio/MediaPipe와 맞추기)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-        with _lock:
-            # detect()에 넘길 현재 카운터를 안전하게 읽는다.
-            cnt = _counter
-            thr = _ear_threshold
+            with _lock:
+                # detect()에 넘길 현재 카운터를 안전하게 읽는다.
+                cnt = _counter
+                thr = _ear_threshold
+                hp_en = _head_pose_enabled
+                hp_y = _head_yaw_thr
+                hp_p = _head_pitch_thr
 
-        # 얼굴/눈 상태 분석 -> 화면 렌더링
-        info = detector.detect(rgb, cnt, ear_threshold=thr)
-        rendered, status = _render(rgb, info)
+            # 얼굴/눈 상태 분석 -> 화면 렌더링
+            info = detector.detect(
+                rgb,
+                cnt,
+                ear_threshold=thr,
+                head_pose_enabled=hp_en,
+                head_yaw_threshold=hp_y,
+                head_pitch_threshold=hp_p,
+            )
+            rendered, status = _render(rgb, info)
 
-        with _lock:
-            # 최신 결과를 UI가 읽을 수 있게 저장
-            _counter       = info["counter"]
-            _latest_frame  = rendered
-            _latest_status = status
+            # 졸음 여부가 바뀔 때만 아두이노 LED 제어 (COM9)
+            _arduino_led.sync(bool(info["drowsy"]))
+
+            with _lock:
+                # 최신 결과를 UI가 읽을 수 있게 저장
+                _counter       = info["counter"]
+                _latest_frame  = rendered
+                _latest_status = status
+    finally:
+        # 웹캠 중지 시 LED 끄고 시리얼 닫기
+        _arduino_led.shutdown()
 
     # 루프가 끝나면 웹캠 장치 해제
     cap.release()
@@ -148,6 +272,27 @@ def update_ear_threshold(value: float) -> str:
     with _lock:
         _ear_threshold = float(value)
     return f"EAR 기준값이 {float(value):.3f}으로 변경되었습니다"
+
+
+def update_head_pose_enabled(value: bool) -> str:
+    global _head_pose_enabled
+    with _lock:
+        _head_pose_enabled = bool(value)
+    return "고개 자세 감지: 사용" if value else "고개 자세 감지: 끔"
+
+
+def update_head_yaw_threshold(value: float) -> str:
+    global _head_yaw_thr
+    with _lock:
+        _head_yaw_thr = float(value)
+    return f"고개 좌우(회전) 임계값: {float(value):.2f} (측정값이 이보다 크면 경고)"
+
+
+def update_head_pitch_threshold(value: float) -> str:
+    global _head_pitch_thr
+    with _lock:
+        _head_pitch_thr = float(value)
+    return f"고개 숙임 임계값: {float(value):.2f} (측정값이 이보다 크면 경고)"
 
 
 def get_latest() -> tuple:
@@ -348,7 +493,9 @@ with gr.Blocks(title="운전자 졸음 감지", head=_ALARM_HEAD_SCRIPT) as demo
         f"# ✏️공부 졸음감지 시스템\n"
         f"눈 개폐도(EAR)를 실시간으로 측정합니다. "
         f"눈이 **{CONSEC_FRAMES}프레임 이상 연속**으로 감기면 졸음으로 판정합니다.\n"
-        f"아래 슬라이더로 EAR 기준값을 조절할 수 있습니다."
+        f"아래 슬라이더로 EAR 기준값을 조절할 수 있습니다.\n"
+        f"**고개 자세 감지**를 켜면 숙임·좌우 회전을 랜드마크 비율로 근사해 경고합니다. "
+        f"임계값은 영상 하단에 표시되는 `yaw`/`pitch` 수치를 보며 조정하세요."
     )
 
     with gr.Row():
@@ -363,6 +510,24 @@ with gr.Blocks(title="운전자 졸음 감지", head=_ALARM_HEAD_SCRIPT) as demo
         value=float(EAR_THRESHOLD),
         step=0.005,
         label="EAR 졸음 판정 기준값 (낮을수록 덜 민감, 높을수록 더 민감)",
+    )
+    head_pose_checkbox = gr.Checkbox(
+        label="고개 자세 감지 사용 (숙임·좌우 회전)",
+        value=False,
+    )
+    head_yaw_slider = gr.Slider(
+        minimum=0.10,
+        maximum=0.60,
+        value=float(HEAD_YAW_THRESHOLD_DEFAULT),
+        step=0.01,
+        label="좌우 회전 임계값 (↑ 올리면 더 둔감, 더 많이 돌려야 경고)",
+    )
+    head_pitch_slider = gr.Slider(
+        minimum=0.20,
+        maximum=0.75,
+        value=float(HEAD_PITCH_THRESHOLD_DEFAULT),
+        step=0.01,
+        label="숙임 임계값 (↑ 올리면 더 둔감, 더 많이 숙여야 경고)",
     )
     gr.HTML(
         """
@@ -596,6 +761,21 @@ with gr.Blocks(title="운전자 졸음 감지", head=_ALARM_HEAD_SCRIPT) as demo
     btn_start.click(fn=start_webcam, outputs=[status_box])
     btn_stop.click(fn=stop_webcam,  outputs=[status_box])
     ear_slider.change(fn=update_ear_threshold, inputs=[ear_slider], outputs=[status_box])
+    head_pose_checkbox.change(
+        fn=update_head_pose_enabled,
+        inputs=[head_pose_checkbox],
+        outputs=[status_box],
+    )
+    head_yaw_slider.change(
+        fn=update_head_yaw_threshold,
+        inputs=[head_yaw_slider],
+        outputs=[status_box],
+    )
+    head_pitch_slider.change(
+        fn=update_head_pitch_threshold,
+        inputs=[head_pitch_slider],
+        outputs=[status_box],
+    )
 
 if __name__ == "__main__":
     demo.launch()
