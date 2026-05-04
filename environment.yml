@@ -10,3 +10,4 @@ dependencies:
     - opencv-python>=4.8
     - mediapipe>=0.10
     - gradio>=4.0
+    - pyserial>=3.5

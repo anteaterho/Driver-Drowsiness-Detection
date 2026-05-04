@@ -1,10 +1,79 @@
 import threading  # 웹캠 캡처를 백그라운드 스레드에서 돌리기 위해 사용
+import time  # 아두이노 USB 연결 직후 리셋 대기
 
 import cv2  # 웹캠 영상 읽기, 색상 변환, 화면에 선/글자 그리기
 import gradio as gr  # 웹에서 실행되는 간단한 UI(버튼, 이미지 출력) 구성
 import numpy as np  # 점 좌표를 배열로 바꿔 눈 윤곽선 그릴 때 사용
 
 from detector import DrowsinessDetector, CONSEC_FRAMES, EAR_THRESHOLD  # 감지 로직 클래스와 기준값들
+
+try:
+    import serial  # 아두이노 COM 포트로 LED 제어
+except ImportError:
+    serial = None  # type: ignore
+
+# Windows 예: COM9. 스케치는 arduino_led/arduino_led.ino ('1'=ON, '0'=OFF)
+ARDUINO_PORT = "COM9"
+ARDUINO_BAUD = 9600
+
+
+class _ArduinoLedSync:
+    """졸음 상태가 바뀔 때만 시리얼로 1/0 전송."""
+
+    def __init__(self, port: str, baud: int) -> None:
+        self._port = port
+        self._baud = baud
+        self._ser = None
+        self._last_sent: bool | None = None
+        self._reset_wait_done = False
+
+    def sync(self, drowsy: bool) -> None:
+        if drowsy == self._last_sent:
+            return
+        self._last_sent = drowsy
+        self._write(b"1\n" if drowsy else b"0\n")
+
+    def _write(self, data: bytes) -> None:
+        if serial is None:
+            return
+        try:
+            if self._ser is None or not self._ser.is_open:
+                self._ser = serial.Serial(self._port, self._baud, timeout=0.2)
+                if not self._reset_wait_done:
+                    time.sleep(1.8)
+                    self._reset_wait_done = True
+            self._ser.write(data)
+            self._ser.flush()
+        except OSError as e:
+            print(f"[Arduino] 포트 오류 ({self._port}): {e}")
+            self._close_port_only()
+        except Exception as e:
+            print(f"[Arduino] 전송 실패: {e}")
+            self._close_port_only()
+
+    def _close_port_only(self) -> None:
+        if self._ser is not None:
+            try:
+                if self._ser.is_open:
+                    self._ser.close()
+            except OSError:
+                pass
+        self._ser = None
+
+    def shutdown(self) -> None:
+        if serial is None:
+            return
+        try:
+            if self._ser is not None and self._ser.is_open:
+                self._ser.write(b"0\n")
+                self._ser.flush()
+        except OSError:
+            pass
+        self._close_port_only()
+        self._last_sent = None
+
+
+_arduino_led = _ArduinoLedSync(ARDUINO_PORT, ARDUINO_BAUD)
 
 # 졸음 감지기 객체를 한 번 만들어서 계속 재사용
 detector = DrowsinessDetector()
@@ -92,31 +161,31 @@ def _capture_loop() -> None:
         _running = False
         return
 
-    # _running이 True인 동안 계속 프레임 처리
-    while _running:
-        ret, bgr = cap.read()
-        if not ret:
-            continue
+    try:
+        while _running:
+            ret, bgr = cap.read()
+            if not ret:
+                continue
 
-        # OpenCV 기본 BGR -> RGB 변환 (Gradio/MediaPipe와 맞추기)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # OpenCV 기본 BGR -> RGB 변환 (Gradio/MediaPipe와 맞추기)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-        with _lock:
-            # detect()에 넘길 현재 카운터를 안전하게 읽는다.
-            cnt = _counter
-            thr = _ear_threshold
+            with _lock:
+                cnt = _counter
+                thr = _ear_threshold
 
-        # 얼굴/눈 상태 분석 -> 화면 렌더링
-        info = detector.detect(rgb, cnt, ear_threshold=thr)
-        rendered, status = _render(rgb, info)
+            info = detector.detect(rgb, cnt, ear_threshold=thr)
+            rendered, status = _render(rgb, info)
 
-        with _lock:
-            # 최신 결과를 UI가 읽을 수 있게 저장
-            _counter       = info["counter"]
-            _latest_frame  = rendered
-            _latest_status = status
+            _arduino_led.sync(bool(info["drowsy"]))
 
-    # 루프가 끝나면 웹캠 장치 해제
+            with _lock:
+                _counter       = info["counter"]
+                _latest_frame  = rendered
+                _latest_status = status
+    finally:
+        _arduino_led.shutdown()
+
     cap.release()
 
 
