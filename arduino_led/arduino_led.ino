@@ -1,6 +1,6 @@
 // 아두이노 Uno 등: USB 시리얼 9600bps
 // PC에서 '1' + 줄바꿈 = 내장 LED(핀 13) ON, '0' + 줄바꿈 = OFF
-// 시리얼 모니터는 닫은 뒤 PC에서 app.py 실행 (COM 포트 중복 불가)
+// 업로드 후 PC 앱(app.py)에서 COM 포트(예: COM9)로 연결 — 시리얼 모니터는 닫을 것
 
 const int LED_PIN = 13;
 
